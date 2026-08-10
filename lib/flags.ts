@@ -15,91 +15,115 @@ export interface AIFeatureFlag {
   rolloutPercentage: number;
 }
 
-// Get AI model for user with feature flag
 export async function getAIModel(flagName: string, userId: string) {
-  const { data: flag } = await supabase
-    .from('ai_feature_flags')
-    .select('*')
-    .eq('name', flagName)
-    .single();
+  try {
+    const { data: flag, error: flagError } = await supabase
+      .from('ai_feature_flags')
+      .select('*')
+      .eq('name', flagName)
+      .single();
 
-  if (!flag || !flag.enabled) {
-    return { model: 'gpt-4-turbo-preview', fallback: true };
+    if (flagError) throw flagError;
+    if (!flag || !flag.enabled) {
+      return { model: 'gpt-4-turbo-preview', fallback: true };
+    }
+
+    const userHash = hashUserId(userId);
+    if (userHash > flag.rollout_percentage) {
+      return { model: 'gpt-4-turbo-preview', fallback: true };
+    }
+
+    const { data: usage, error: usageError } = await supabase
+      .from('ai_usage')
+      .select('cost')
+      .eq('user_id', userId)
+      .eq('flag_name', flagName)
+      .gte('created_at', getMonthStart());
+
+    if (usageError) throw usageError;
+
+    const totalCost = usage?.reduce((sum, u) => sum + u.cost, 0) || 0;
+    if (totalCost >= flag.cost_limit) {
+      return { model: 'gpt-4-turbo-preview', fallback: true, reason: 'cost_limit' };
+    }
+
+    return { model: flag.model, fallback: false };
+  } catch (error: any) {
+    throw new Error(`Feature flag error: ${error?.message || 'Unknown error'}`);
   }
-
-  // Check rollout percentage
-  const userHash = hashUserId(userId);
-  if (userHash > flag.rollout_percentage) {
-    return { model: 'gpt-4-turbo-preview', fallback: true };
-  }
-
-  // Check cost limits
-  const { data: usage } = await supabase
-    .from('ai_usage')
-    .select('cost')
-    .eq('user_id', userId)
-    .eq('flag_name', flagName)
-    .gte('created_at', getMonthStart());
-
-  const totalCost = usage?.reduce((sum, u) => sum + u.cost, 0) || 0;
-  if (totalCost >= flag.cost_limit) {
-    return { model: 'gpt-4-turbo-preview', fallback: true, reason: 'cost_limit' };
-  }
-
-  return { model: flag.model, fallback: false };
 }
 
-// Track AI usage
 export async function trackUsage(flagName: string, userId: string, tokens: number, cost: number) {
-  await supabase.from('ai_usage').insert({
-    flag_name: flagName,
-    user_id: userId,
-    tokens,
-    cost,
-    created_at: new Date().toISOString(),
-  });
+  try {
+    const { error } = await supabase.from('ai_usage').insert({
+      flag_name: flagName,
+      user_id: userId,
+      tokens,
+      cost,
+      created_at: new Date().toISOString(),
+    });
+
+    if (error) throw error;
+  } catch (error: any) {
+    throw new Error(`Usage tracking error: ${error?.message || 'Unknown error'}`);
+  }
 }
 
-// Monitor quality
 export async function monitorQuality(flagName: string, metric: number) {
-  const { data: flag } = await supabase
-    .from('ai_feature_flags')
-    .select('quality_threshold')
-    .eq('name', flagName)
-    .single();
+  try {
+    const { data: flag, error: flagError } = await supabase
+      .from('ai_feature_flags')
+      .select('quality_threshold')
+      .eq('name', flagName)
+      .single();
 
-  if (flag && metric < flag.quality_threshold) {
-    // Auto-disable flag on quality degradation
-    await supabase
+    if (flagError) throw flagError;
+
+    if (flag && metric < flag.quality_threshold) {
+      const { error: updateError } = await supabase
+        .from('ai_feature_flags')
+        .update({ enabled: false })
+        .eq('name', flagName);
+
+      if (updateError) throw updateError;
+
+      const { error: alertError } = await supabase.from('ai_alerts').insert({
+        flag_name: flagName,
+        type: 'quality_degradation',
+        metric,
+        threshold: flag.quality_threshold,
+      });
+
+      if (alertError) throw alertError;
+
+      return { rolledBack: true, reason: 'quality_degradation' };
+    }
+
+    return { rolledBack: false };
+  } catch (error: any) {
+    throw new Error(`Quality monitoring error: ${error?.message || 'Unknown error'}`);
+  }
+}
+
+export async function rollbackFlag(flagName: string, reason: string) {
+  try {
+    const { error: updateError } = await supabase
       .from('ai_feature_flags')
       .update({ enabled: false })
       .eq('name', flagName);
 
-    await supabase.from('ai_alerts').insert({
+    if (updateError) throw updateError;
+
+    const { error: logError } = await supabase.from('ai_rollback_log').insert({
       flag_name: flagName,
-      type: 'quality_degradation',
-      metric,
-      threshold: flag.quality_threshold,
+      reason,
+      rolled_back_at: new Date().toISOString(),
     });
 
-    return { rolledBack: true, reason: 'quality_degradation' };
+    if (logError) throw logError;
+  } catch (error: any) {
+    throw new Error(`Rollback error: ${error?.message || 'Unknown error'}`);
   }
-
-  return { rolledBack: false };
-}
-
-// Rollback flag
-export async function rollbackFlag(flagName: string, reason: string) {
-  await supabase
-    .from('ai_feature_flags')
-    .update({ enabled: false })
-    .eq('name', flagName);
-
-  await supabase.from('ai_rollback_log').insert({
-    flag_name: flagName,
-    reason,
-    rolled_back_at: new Date().toISOString(),
-  });
 }
 
 function hashUserId(userId: string): number {
